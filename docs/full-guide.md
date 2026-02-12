@@ -234,28 +234,24 @@ cp .env.example .env
 vim .env  # 填入 API Key 和配置
 
 # 3. 启动容器
-docker-compose -f ./docker/docker-compose.yml up -d webui      # WebUI 模式（推荐）
+docker-compose -f ./docker/docker-compose.yml up -d server     # Web 服务模式（推荐，提供 API 与 WebUI）
 docker-compose -f ./docker/docker-compose.yml up -d analyzer   # 定时任务模式
-docker-compose -f ./docker/docker-compose.yml up -d server     # FastAPI Web模式（和WebUI模式占用相同端口注意避免冲突）
 docker-compose -f ./docker/docker-compose.yml up -d            # 同时启动两种模式
 
 # 4. 访问 WebUI
 # http://localhost:8000
 
 # 5. 查看日志
-docker-compose -f ./docker/docker-compose.yml logs -f webui
+docker-compose -f ./docker/docker-compose.yml logs -f server
 ```
 
 ### 运行模式说明
 
 | 命令 | 说明 | 端口 |
 |------|------|------|
-| `docker-compose -f ./docker/docker-compose.yml up -d webui` | WebUI 模式，手动触发分析 | 8000 |
+| `docker-compose -f ./docker/docker-compose.yml up -d server` | Web 服务模式，提供 API 与 WebUI | 8000 |
 | `docker-compose -f ./docker/docker-compose.yml up -d analyzer` | 定时任务模式，每日自动执行 | - |
-| `docker-compose -f ./docker/docker-compose.yml up -d server` | FastAPI 模式，提供 API 与静态资源 | 8000 |
 | `docker-compose -f ./docker/docker-compose.yml up -d` | 同时启动两种模式 | 8000 |
-
-> 注意：WebUI 与 FastAPI 默认端口都是 8000，若需同时启动请设置 `WEBUI_PORT` 与 `API_PORT`。
 
 ### Docker Compose 配置
 

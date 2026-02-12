@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 核心分析流水线
 
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import List, Dict, Any, Optional, Tuple
@@ -292,8 +293,13 @@ class StockAnalysisPipeline:
                 result.change_pct = realtime_data.get('change_pct')
 
             # Step 8: 保存分析历史记录
+            # Fix #281/#298: generate a unique query_id per stock so each
+            # history detail page shows its own analysis result instead of
+            # reusing the batch-level id which caused all stocks to resolve
+            # to the same detail record.
             if result:
                 try:
+                    per_stock_query_id = uuid.uuid4().hex
                     context_snapshot = self._build_context_snapshot(
                         enhanced_context=enhanced_context,
                         news_content=news_context,
@@ -302,7 +308,7 @@ class StockAnalysisPipeline:
                     )
                     self.db.save_analysis_history(
                         result=result,
-                        query_id=self.query_id or "",
+                        query_id=per_stock_query_id,
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
