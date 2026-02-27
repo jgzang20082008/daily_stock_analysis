@@ -7,6 +7,7 @@ python-dotenv>=1.0.0        # 环境变量配置管理
 tenacity>=8.2.0             # 重试机制（指数退避）
 sqlalchemy>=2.0.0           # ORM数据库操作
 schedule>=1.2.0             # 定时任务调度
+exchange-calendars>=4.5.0   # 交易日历（A股/港股/美股，Issue #373）
 
 # 数据源依赖（多源策略，按优先级排序）
 efinance>=0.5.5             # Priority 0: 东方财富数据源（最高优先级）https://github.com/Micro-sheep/efinance
@@ -25,7 +26,9 @@ numpy>=1.24.0               # 数值计算
 json-repair>=0.55.1         # JSON 修复
 
 # AI 分析
-google-generativeai>=0.8.0  # Gemini API
+google-generativeai>=0.8.0  # Gemini API (used by analyzer.py and image_stock_extractor.py)
+google-genai>=1.0.0          # Gemini API new SDK (used by llm_adapter.py for agent tool-calling)
+anthropic>=0.18.0           # Anthropic Claude API（可选）
 openai>=1.0.0               # OpenAI 兼容 API（可选，支持 DeepSeek/通义千问等）
 
 # 搜索引擎（用于获取股票新闻）
@@ -35,6 +38,7 @@ google-search-results>=2.4.0  # SerpAPI（每月 100 次免费）
 # 网络请求
 requests>=2.31.0            # HTTP 请求
 markdown2>=2.4.0            # Markdown 转 HTML
+imgkit>=1.2.0              # Markdown 转图片（需安装 wkhtmltopdf）
 fake-useragent>=1.4.0       # 随机 User-Agent 防封禁
 httpx[socks]                # HTTP 客户端 + SOCKS 代理支持（OpenAI 可选依赖）
 dingtalk-stream >= 0.24.3    # 钉钉 Stream SDK
@@ -51,3 +55,4 @@ lxml_html_clean             # Fix for lxml.html.clean ImportError in newer lxml 
 # FastAPI Web 框架
 fastapi>=0.109.0            # 现代 Python Web 框架
 uvicorn[standard]>=0.27.0   # ASGI 服务器
+python-multipart>=0.0.6     # FastAPI File/Form upload support

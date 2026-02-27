@@ -21,8 +21,36 @@ from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
 import requests
 from newspaper import Article, Config
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
+from data_provider.us_index_mapping import is_us_index_code
 
 logger = logging.getLogger(__name__)
+
+# Transient network errors (retryable)
+_SEARCH_TRANSIENT_EXCEPTIONS = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(_SEARCH_TRANSIENT_EXCEPTIONS),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+def _post_with_retry(url: str, *, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> requests.Response:
+    """POST with retry on transient SSL/network errors."""
+    return requests.post(url, headers=headers, json=json, timeout=timeout)
 
 
 def fetch_url_content(url: str, timeout: int = 5) -> str:
@@ -290,7 +318,7 @@ class TavilySearchProvider(BaseSearchProvider):
             parsed = urlparse(url)
             domain = parsed.netloc.replace('www.', '')
             return domain or '未知来源'
-        except:
+        except Exception:
             return '未知来源'
 
 
@@ -494,7 +522,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
             from urllib.parse import urlparse
             parsed = urlparse(url)
             return parsed.netloc.replace('www.', '') or '未知来源'
-        except:
+        except Exception:
             return '未知来源'
 
 
@@ -556,8 +584,8 @@ class BochaSearchProvider(BaseSearchProvider):
                 "count": min(max_results, 50)  # 最大50条
             }
             
-            # 执行搜索
-            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            # 执行搜索（带瞬时 SSL/网络错误重试）
+            response = _post_with_retry(url, headers=headers, json=payload, timeout=10)
             
             # 检查HTTP状态码
             if response.status_code != 200:
@@ -568,7 +596,7 @@ class BochaSearchProvider(BaseSearchProvider):
                         error_message = error_data.get('message', response.text)
                     else:
                         error_message = response.text
-                except:
+                except Exception:
                     error_message = response.text
                 
                 # 根据错误码处理
@@ -691,7 +719,7 @@ class BochaSearchProvider(BaseSearchProvider):
             parsed = urlparse(url)
             domain = parsed.netloc.replace('www.', '')
             return domain or '未知来源'
-        except:
+        except Exception:
             return '未知来源'
 
 
@@ -856,7 +884,7 @@ class BraveSearchProvider(BaseSearchProvider):
                     return error_data['error']
                 return str(error_data)
             return response.text[:200]
-        except:
+        except Exception:
             return f"HTTP {response.status_code}: {response.text[:200]}"
 
     @staticmethod
@@ -867,7 +895,7 @@ class BraveSearchProvider(BaseSearchProvider):
             parsed = urlparse(url)
             domain = parsed.netloc.replace('www.', '')
             return domain or '未知来源'
-        except:
+        except Exception:
             return '未知来源'
 
 
@@ -907,6 +935,7 @@ class SearchService:
         tavily_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
+        news_max_age_days: int = 3,
     ):
         """
         初始化搜索服务
@@ -916,8 +945,10 @@ class SearchService:
             tavily_keys: Tavily API Key 列表
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
+            news_max_age_days: 新闻最大时效（天）
         """
         self._providers: List[BaseSearchProvider] = []
+        self.news_max_age_days = max(1, news_max_age_days)
 
         # 初始化搜索引擎（按优先级排序）
         # 1. Bocha 优先（中文搜索优化，AI摘要）
@@ -962,6 +993,31 @@ class SearchService:
             return True
         if code.isdigit() and len(code) == 5:
             return True
+        return False
+
+    # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
+    _A_ETF_PREFIXES = ('51', '52', '56', '58', '15', '16', '18')
+    _ETF_NAME_KEYWORDS = ('ETF', 'FUND', 'TRUST', 'INDEX', 'TRACKER', 'UNIT')  # US/HK ETF name hints
+
+    @staticmethod
+    def is_index_or_etf(stock_code: str, stock_name: str) -> bool:
+        """
+        Judge if symbol is index-tracking ETF or market index.
+        For such symbols, analysis focuses on index movement only, not issuer company risks.
+        """
+        code = (stock_code or '').strip().split('.')[0]
+        if not code:
+            return False
+        # A-share ETF
+        if code.isdigit() and len(code) == 6 and code.startswith(SearchService._A_ETF_PREFIXES):
+            return True
+        # US index (SPX, DJI, IXIC etc.)
+        if is_us_index_code(code):
+            return True
+        # US/HK ETF: foreign symbol + name contains fund-like keywords
+        if SearchService._is_foreign_stock(code):
+            name_upper = (stock_name or '').upper()
+            return any(kw in name_upper for kw in SearchService._ETF_NAME_KEYWORDS)
         return False
 
     @property
@@ -1027,13 +1083,15 @@ class SearchService:
         # 1. 周二至周五：搜索近1天（24小时）
         # 2. 周六、周日：搜索近2-3天（覆盖周末）
         # 3. 周一：搜索近3天（覆盖周末）
+        # 4. 用 NEWS_MAX_AGE_DAYS 限制上限
         today_weekday = datetime.now().weekday()
-        if today_weekday == 0: # 周一
-            search_days = 3
-        elif today_weekday >= 5: # 周六(5)、周日(6)
-            search_days = 2
-        else: # 周二(1) - 周五(4)
-            search_days = 1
+        if today_weekday == 0:  # 周一
+            weekday_days = 3
+        elif today_weekday >= 5:  # 周六(5)、周日(6)
+            weekday_days = 2
+        else:  # 周二(1) - 周五(4)
+            weekday_days = 1
+        search_days = min(weekday_days, self.news_max_age_days)
 
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
@@ -1152,66 +1210,43 @@ class SearchService:
         """
         results = {}
         search_count = 0
-        
-        # 根据股票类型选择搜索关键词语言
-        is_foreign = self._is_foreign_stock(stock_code)
 
-        # 定义搜索维度
+        is_foreign = self._is_foreign_stock(stock_code)
+        is_index_etf = self.is_index_or_etf(stock_code, stock_name)
+
         if is_foreign:
             search_dimensions = [
-                {
-                    'name': 'latest_news',
-                    'query': f"{stock_name} {stock_code} latest news events",
-                    'desc': '最新消息'
-                },
-                {
-                    'name': 'market_analysis',
-                    'query': f"{stock_name} analyst rating target price report",
-                    'desc': '机构分析'
-                },
-                {
-                    'name': 'risk_check',
-                    'query': f"{stock_name} risk insider selling lawsuit litigation",
-                    'desc': '风险排查'
-                },
-                {
-                    'name': 'earnings',
-                    'query': f"{stock_name} earnings revenue profit growth forecast",
-                    'desc': '业绩预期'
-                },
-                {
-                    'name': 'industry',
-                    'query': f"{stock_name} industry competitors market share outlook",
-                    'desc': '行业分析'
-                },
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} latest news events", 'desc': '最新消息'},
+                {'name': 'market_analysis', 'query': f"{stock_name} analyst rating target price report", 'desc': '机构分析'},
+                {'name': 'risk_check', 'query': (
+                    f"{stock_name} {stock_code} index performance outlook tracking error"
+                    if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
+                ), 'desc': '风险排查'},
+                {'name': 'earnings', 'query': (
+                    f"{stock_name} {stock_code} index performance composition outlook"
+                    if is_index_etf else f"{stock_name} earnings revenue profit growth forecast"
+                ), 'desc': '业绩预期'},
+                {'name': 'industry', 'query': (
+                    f"{stock_name} {stock_code} index sector allocation holdings"
+                    if is_index_etf else f"{stock_name} industry competitors market share outlook"
+                ), 'desc': '行业分析'},
             ]
         else:
             search_dimensions = [
-                {
-                    'name': 'latest_news',
-                    'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件",
-                    'desc': '最新消息'
-                },
-                {
-                    'name': 'market_analysis',
-                    'query': f"{stock_name} 研报 目标价 评级 深度分析",
-                    'desc': '机构分析'
-                },
-                {
-                    'name': 'risk_check',
-                    'query': f"{stock_name} 减持 处罚 违规 诉讼 利空 风险",
-                    'desc': '风险排查'
-                },
-                {
-                    'name': 'earnings',
-                    'query': f"{stock_name} 业绩预告 财报 营收 净利润 同比增长",
-                    'desc': '业绩预期'
-                },
-                {
-                    'name': 'industry',
-                    'query': f"{stock_name} 所在行业 竞争对手 市场份额 行业前景",
-                    'desc': '行业分析'
-                },
+                {'name': 'latest_news', 'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件", 'desc': '最新消息'},
+                {'name': 'market_analysis', 'query': f"{stock_name} 研报 目标价 评级 深度分析", 'desc': '机构分析'},
+                {'name': 'risk_check', 'query': (
+                    f"{stock_name} 指数走势 跟踪误差 净值 表现"
+                    if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
+                ), 'desc': '风险排查'},
+                {'name': 'earnings', 'query': (
+                    f"{stock_name} 指数成分 净值 跟踪表现"
+                    if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
+                ), 'desc': '业绩预期'},
+                {'name': 'industry', 'query': (
+                    f"{stock_name} 指数成分股 行业配置 权重"
+                    if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
+                ), 'desc': '行业分析'},
             ]
         
         logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
@@ -1233,7 +1268,7 @@ class SearchService:
             
             logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
             
-            response = provider.search(dim['query'], max_results=3)
+            response = provider.search(dim['query'], max_results=3, days=self.news_max_age_days)
             results[dim['name']] = response
             search_count += 1
             
@@ -1516,6 +1551,7 @@ def get_search_service() -> SearchService:
             tavily_keys=config.tavily_api_keys,
             brave_keys=config.brave_api_keys,
             serpapi_keys=config.serpapi_keys,
+            news_max_age_days=config.news_max_age_days,
         )
     
     return _search_service
